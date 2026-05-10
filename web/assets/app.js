@@ -4,31 +4,68 @@ const state = {
   selected: { symbol: "2408.TW", name: "南亞科" },
   prices: [],
   hoverIndex: null,
-  searchTimer: null
+  searchTimer: null,
+  analyzing: false,
 };
 
 const el = {
-  form: $("searchForm"), search: $("symbolSearch"), suggestions: $("suggestions"), market: $("market"),
-  targetMode: $("targetMode"), years: $("years"), chartDays: $("chartDays"), backtestDays: $("backtestDays"),
-  retrainEvery: $("retrainEvery"), threshold: $("threshold"), external: $("external"), status: $("statusBar"),
-  canvas: $("klineCanvas"), hoverInfo: $("hoverInfo"), chartTitle: $("chartTitle"), messageBox: $("messageBox"),
-  direction: $("direction"), confidence: $("confidence"), probUp: $("probUp"), probDown: $("probDown"),
-  technicalProb: $("technicalProb"), externalAdjustment: $("externalAdjustment"), latestClose: $("latestClose"), latestDate: $("latestDate"),
-  backtestAccuracy: $("backtestAccuracy"), backtestEdge: $("backtestEdge"), newsLabel: $("newsLabel"), newsScore: $("newsScore"),
-  relatedLabel: $("relatedLabel"), relatedScore: $("relatedScore"), institutionalLabel: $("institutionalLabel"), flowSummary: $("flowSummary"),
-  factorAdjustment: $("factorAdjustment"), factorGrid: $("factorGrid"), newsRows: $("newsRows"), marketRows: $("marketRows"),
-  macroSummary: $("macroSummary"), macroList: $("macroList"), relatedRows: $("relatedRows"), flowRows: $("flowRows"),
-  batchSymbols: $("batchSymbols"), batchButton: $("batchButton"), batchRows: $("batchRows"),
-  bestPickSymbol: $("bestPickSymbol"), bestPickMeta: $("bestPickMeta"), bestPickReasons: $("bestPickReasons"), recommendButton: $("recommendButton"),
-  clockDate: $("clockDate"), clockTime: $("clockTime")
+  form: $("searchForm"),
+  search: $("symbolSearch"),
+  suggestions: $("suggestions"),
+  market: $("market"),
+  targetMode: $("targetMode"),
+  years: $("years"),
+  chartDays: $("chartDays"),
+  backtestDays: $("backtestDays"),
+  retrainEvery: $("retrainEvery"),
+  threshold: $("threshold"),
+  external: $("external"),
+  status: $("statusBar"),
+  canvas: $("klineCanvas"),
+  hoverInfo: $("hoverInfo"),
+  chartTitle: $("chartTitle"),
+  messageBox: $("messageBox"),
+  direction: $("direction"),
+  confidence: $("confidence"),
+  probUp: $("probUp"),
+  probDown: $("probDown"),
+  technicalProb: $("technicalProb"),
+  externalAdjustment: $("externalAdjustment"),
+  latestClose: $("latestClose"),
+  latestDate: $("latestDate"),
+  backtestAccuracy: $("backtestAccuracy"),
+  backtestEdge: $("backtestEdge"),
+  newsLabel: $("newsLabel"),
+  newsScore: $("newsScore"),
+  relatedLabel: $("relatedLabel"),
+  relatedScore: $("relatedScore"),
+  institutionalLabel: $("institutionalLabel"),
+  flowSummary: $("flowSummary"),
+  factorAdjustment: $("factorAdjustment"),
+  factorGrid: $("factorGrid"),
+  newsRows: $("newsRows"),
+  marketRows: $("marketRows"),
+  macroSummary: $("macroSummary"),
+  macroList: $("macroList"),
+  relatedRows: $("relatedRows"),
+  flowRows: $("flowRows"),
+  batchSymbols: $("batchSymbols"),
+  batchButton: $("batchButton"),
+  batchRows: $("batchRows"),
+  bestPickSymbol: $("bestPickSymbol"),
+  bestPickMeta: $("bestPickMeta"),
+  bestPickReasons: $("bestPickReasons"),
+  recommendButton: $("recommendButton"),
+  clockDate: $("clockDate"),
+  clockTime: $("clockTime"),
 };
 
 const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (m) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" }[m]));
-const num = (value) => Number.isFinite(Number(value)) ? Number(value) : null;
-const pct = (value, digits = 1) => num(value) === null ? "--" : `${(Number(value) * 100).toFixed(digits)}%`;
-const signed = (value, digits = 2) => num(value) === null ? "--" : `${Number(value) >= 0 ? "+" : ""}${Number(value).toFixed(digits)}`;
-const money = (value) => num(value) === null ? "--" : Number(value).toLocaleString("zh-TW", { maximumFractionDigits: Number(value) >= 1000 ? 0 : 2 });
-const flow = (value) => num(value) === null ? "--" : Number(value).toLocaleString("zh-TW", { maximumFractionDigits: 0 });
+const number = (value) => (Number.isFinite(Number(value)) ? Number(value) : null);
+const pct = (value, digits = 1) => (number(value) === null ? "--" : `${(Number(value) * 100).toFixed(digits)}%`);
+const signed = (value, digits = 2) => (number(value) === null ? "--" : `${Number(value) >= 0 ? "+" : ""}${Number(value).toFixed(digits)}`);
+const money = (value) => (number(value) === null ? "--" : Number(value).toLocaleString("zh-TW", { maximumFractionDigits: Number(value) >= 1000 ? 0 : 2 }));
+const flow = (value) => (number(value) === null ? "--" : Number(value).toLocaleString("zh-TW", { maximumFractionDigits: 0 }));
 const isUp = (direction) => String(direction || "").includes("上") || String(direction || "").toLowerCase() === "up";
 
 function setStatus(text, type = "") {
@@ -41,11 +78,30 @@ function showMessage(text) {
   el.messageBox.textContent = text || "";
 }
 
-async function getJson(url, options = {}) {
-  const response = await fetch(url, options);
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
-  return data;
+async function getJson(url, options = {}, timeoutMs = 120000) {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
+    return data;
+  } catch (error) {
+    if (error.name === "AbortError") {
+      throw new Error("分析超過 120 秒，請先關閉外部資料或降低歷史年數後再試。");
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
+function applyFastDefaults() {
+  el.years.value = "2";
+  el.chartDays.value = "120";
+  el.backtestDays.value = "90";
+  el.retrainEvery.value = "40";
+  el.external.checked = false;
 }
 
 function analysisParams() {
@@ -59,7 +115,7 @@ function analysisParams() {
     backtest_days: el.backtestDays.value,
     retrain_every: el.retrainEvery.value,
     threshold: el.threshold.value,
-    external: el.external.checked ? "true" : "false"
+    external: el.external.checked ? "true" : "false",
   });
 }
 
@@ -77,7 +133,7 @@ async function searchSymbols() {
     return;
   }
   try {
-    const data = await getJson(`/api/search?${new URLSearchParams({ q: query, market: el.market.value, limit: "12" })}`);
+    const data = await getJson(`/api/search?${new URLSearchParams({ q: query, market: el.market.value, limit: "12" })}`, {}, 30000);
     const items = data.items || [];
     el.suggestions.innerHTML = items.map((item) => `
       <button type="button" class="suggestion" data-symbol="${esc(item.symbol)}" data-name="${esc(item.name || "")}">
@@ -92,19 +148,25 @@ async function searchSymbols() {
 
 async function analyze(event) {
   event?.preventDefault();
+  if (state.analyzing) return;
   const typed = el.search.value.trim();
   if (!typed) return;
   if (!typed.includes(state.selected.symbol)) selectSymbol(typed.split(/\s+/)[0], "");
 
-  setStatus(`正在分析 ${state.selected.symbol}：價格、新聞、大盤、同業、籌碼與十因子...`, "loading");
-  showMessage("模型分析需要抓取多個免費市場資料源，第一次載入可能會比較久。");
+  state.analyzing = true;
+  el.form.querySelector("button[type='submit']").disabled = true;
+  setStatus(`正在分析 ${state.selected.symbol}，第一次查詢可能需要 10 到 40 秒...`, "loading");
+  showMessage(el.external.checked ? "進階外部資料已開啟，會額外抓新聞、法人與關聯市場，因此會比較久。" : "目前使用快速模式。需要新聞、法人與美股關聯時，可以勾選外部資料後再分析。");
   try {
     const data = await getJson(`/api/analyze?${analysisParams()}`);
     renderAnalysis(data);
     setStatus(`完成 ${data.symbol} 隔日開盤預測`, "");
   } catch (error) {
     setStatus(`分析失敗：${error.message}`, "error");
-    showMessage("請檢查股票代號格式，例如 2408.TW、2344.TW、MU。免費資料源偶爾會限流，稍後再試通常可恢復。");
+    showMessage("如果是 Render 免費版剛喚醒，請等 30 秒後重試。若仍然太慢，先取消勾選「新聞 / 法人 / 美股關聯」。");
+  } finally {
+    state.analyzing = false;
+    el.form.querySelector("button[type='submit']").disabled = false;
   }
 }
 
@@ -115,9 +177,10 @@ function renderAnalysis(data) {
   state.selected = { symbol: data.symbol || prediction.symbol || state.selected.symbol, name: data.name || state.selected.name };
 
   const up = isUp(prediction.direction);
+  const card = el.direction.closest(".signal-card");
   el.direction.textContent = up ? "看漲" : "看跌";
-  el.direction.closest(".signal-card")?.classList.toggle("up", up);
-  el.direction.closest(".signal-card")?.classList.toggle("down", !up);
+  card?.classList.toggle("up", up);
+  card?.classList.toggle("down", !up);
   el.confidence.textContent = `信心 ${pct(prediction.confidence)} (${prediction.confidence_label || "--"})`;
   el.probUp.textContent = pct(prediction.probability_up);
   el.probDown.textContent = `下跌 ${pct(prediction.probability_down)}`;
@@ -153,30 +216,25 @@ function renderFactors(factors, adjustment) {
       <b>${signed(factor.score)}</b>
       <small>${esc(factor.label || factor.detail || "中性")}</small>
     </article>`;
-  }).join("") || `<article class="factor-card"><strong>等待資料</strong><small>尚無十因子資料。</small></article>`;
+  }).join("") || `<article class="factor-card"><strong>快速模式</strong><small>勾選外部資料後會顯示十因子矩陣。</small></article>`;
 }
 
 function renderNews(news) {
   const items = news.items || [];
   el.newsRows.innerHTML = items.map((item) => `
-    <tr>
-      <td>${esc((item.published_at || "").slice(0, 16) || "--")}</td>
-      <td>${esc(item.publisher || "--")}</td>
+    <tr><td>${esc((item.published_at || "").slice(0, 16) || "--")}</td><td>${esc(item.publisher || "--")}</td>
       <td><a href="${esc(item.link || "#")}" target="_blank" rel="noreferrer">${esc(item.title || "無標題")}</a></td>
-      <td class="${Number(item.score) >= 0 ? "up-text" : "down-text"}">${signed(item.score)}</td>
-    </tr>`).join("") || `<tr><td colspan="4">目前沒有抓到新聞。</td></tr>`;
+      <td class="${Number(item.score) >= 0 ? "up-text" : "down-text"}">${signed(item.score)}</td></tr>`).join("") || `<tr><td colspan="4">快速模式未抓新聞，勾選外部資料後再分析即可顯示。</td></tr>`;
 }
 
 function renderMarket(market, macro) {
   const moves = market.moves || [];
   el.marketRows.innerHTML = moves.map((item) => `
-    <tr>
-      <td>${esc(item.name || item.symbol)}</td><td>${esc(item.category || "--")}</td><td>${esc(item.latest_date || "--")}</td>
+    <tr><td>${esc(item.name || item.symbol)}</td><td>${esc(item.category || "--")}</td><td>${esc(item.latest_date || "--")}</td>
       <td class="${Number(item.return_1d) >= 0 ? "up-text" : "down-text"}">${pct(item.return_1d)}</td>
-      <td class="${Number(item.return_5d) >= 0 ? "up-text" : "down-text"}">${pct(item.return_5d)}</td><td>${signed(item.score)}</td>
-    </tr>`).join("") || `<tr><td colspan="6">市場資料不足。</td></tr>`;
-  el.macroSummary.textContent = macro.label || market.message || "宏觀資料會依資料源可用性更新。";
-  el.macroList.innerHTML = (macro.highlights || []).map((item) => `<li>${esc(item)}</li>`).join("") || `<li>尚無重大宏觀事件摘要。</li>`;
+      <td class="${Number(item.return_5d) >= 0 ? "up-text" : "down-text"}">${pct(item.return_5d)}</td><td>${signed(item.score)}</td></tr>`).join("") || `<tr><td colspan="6">快速模式未抓大盤外部資料。</td></tr>`;
+  el.macroSummary.textContent = macro.label || market.message || "快速模式未抓宏觀資料。";
+  el.macroList.innerHTML = (macro.highlights || []).map((item) => `<li>${esc(item)}</li>`).join("") || `<li>勾選外部資料後會抓宏觀事件摘要。</li>`;
 }
 
 function renderRelated(related) {
@@ -185,13 +243,13 @@ function renderRelated(related) {
     <tr><td>${esc(item.symbol)}</td><td>${esc(item.latest_date || "--")}</td>
       <td class="${Number(item.return_1d) >= 0 ? "up-text" : "down-text"}">${pct(item.return_1d)}</td>
       <td class="${Number(item.return_5d) >= 0 ? "up-text" : "down-text"}">${pct(item.return_5d)}</td>
-      <td class="${Number(item.return_20d) >= 0 ? "up-text" : "down-text"}">${pct(item.return_20d)}</td></tr>`).join("") || `<tr><td colspan="5">未找到明確同業關聯。</td></tr>`;
+      <td class="${Number(item.return_20d) >= 0 ? "up-text" : "down-text"}">${pct(item.return_20d)}</td></tr>`).join("") || `<tr><td colspan="5">快速模式未抓同業關聯。</td></tr>`;
 }
 
 function renderFlow(institutional) {
   const rows = institutional.rows || [];
   el.flowRows.innerHTML = rows.map((item) => `
-    <tr><td>${esc(item.date)}</td><td>${flow(item.foreign_net)}</td><td>${flow(item.investment_trust_net)}</td><td>${flow(item.dealer_net)}</td><td>${flow(item.total_net)}</td></tr>`).join("") || `<tr><td colspan="5">${esc(institutional.message || "目前沒有法人籌碼資料。")}</td></tr>`;
+    <tr><td>${esc(item.date)}</td><td>${flow(item.foreign_net)}</td><td>${flow(item.investment_trust_net)}</td><td>${flow(item.dealer_net)}</td><td>${flow(item.total_net)}</td></tr>`).join("") || `<tr><td colspan="5">${esc(institutional.message || "快速模式未抓法人籌碼。")}</td></tr>`;
 }
 
 function candleValue(row, key) {
@@ -207,22 +265,26 @@ function drawCandles() {
   canvas.width = Math.floor(rect.width * ratio);
   canvas.height = Math.floor(rect.height * ratio);
   ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
-  const w = rect.width, h = rect.height;
+  const w = rect.width;
+  const h = rect.height;
   ctx.clearRect(0, 0, w, h);
   ctx.fillStyle = "#0d1117";
   ctx.fillRect(0, 0, w, h);
 
-  const data = state.prices.slice(-Number(el.chartDays.value || 180));
+  const data = state.prices.slice(-Number(el.chartDays.value || 120));
   if (!data.length) {
     ctx.fillStyle = "#8b98a8";
     ctx.fillText("等待價格資料", 24, 34);
     return;
   }
   const pad = { l: 52, r: 20, t: 18, b: 32 };
-  const innerW = w - pad.l - pad.r, innerH = h - pad.t - pad.b;
+  const innerW = w - pad.l - pad.r;
+  const innerH = h - pad.t - pad.b;
   const highs = data.map((d) => Number(candleValue(d, "high"))).filter(Number.isFinite);
   const lows = data.map((d) => Number(candleValue(d, "low"))).filter(Number.isFinite);
-  const max = Math.max(...highs), min = Math.min(...lows), span = Math.max(max - min, 0.01);
+  const max = Math.max(...highs);
+  const min = Math.min(...lows);
+  const span = Math.max(max - min, 0.01);
   const y = (v) => pad.t + (max - v) / span * innerH;
   const x = (i) => pad.l + (i + 0.5) * innerW / data.length;
 
@@ -232,7 +294,10 @@ function drawCandles() {
   for (let i = 0; i <= 4; i++) {
     const yy = pad.t + innerH * i / 4;
     const value = max - span * i / 4;
-    ctx.beginPath(); ctx.moveTo(pad.l, yy); ctx.lineTo(w - pad.r, yy); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(pad.l, yy);
+    ctx.lineTo(w - pad.r, yy);
+    ctx.stroke();
     ctx.fillText(money(value), 6, yy + 4);
   }
 
@@ -247,7 +312,10 @@ function drawCandles() {
     const xx = x(i);
     ctx.strokeStyle = color;
     ctx.fillStyle = color;
-    ctx.beginPath(); ctx.moveTo(xx, y(high)); ctx.lineTo(xx, y(low)); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(xx, y(high));
+    ctx.lineTo(xx, y(low));
+    ctx.stroke();
     const top = Math.min(y(open), y(close));
     const bodyH = Math.max(2, Math.abs(y(open) - y(close)));
     ctx.fillRect(xx - candleW / 2, top, candleW, bodyH);
@@ -262,7 +330,10 @@ function drawCandles() {
   if (hover != null) {
     const xx = x(Math.max(0, Math.min(data.length - 1, hover)));
     ctx.strokeStyle = "rgba(255,255,255,.36)";
-    ctx.beginPath(); ctx.moveTo(xx, pad.t); ctx.lineTo(xx, h - pad.b); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(xx, pad.t);
+    ctx.lineTo(xx, h - pad.b);
+    ctx.stroke();
   }
   el.hoverInfo.textContent = `${candleValue(shown, "date")} O ${money(candleValue(shown, "open"))} H ${money(candleValue(shown, "high"))} L ${money(candleValue(shown, "low"))} C ${money(candleValue(shown, "close"))} Vol ${flow(candleValue(shown, "volume"))}`;
 }
@@ -277,17 +348,21 @@ function drawAverage(ctx, data, windowSize, x, y, color) {
     if (i + 1 < windowSize) return;
     const slice = closes.slice(i + 1 - windowSize, i + 1);
     const avg = slice.reduce((a, b) => a + b, 0) / windowSize;
-    if (!started) { ctx.moveTo(x(i), y(avg)); started = true; }
-    else ctx.lineTo(x(i), y(avg));
+    if (!started) {
+      ctx.moveTo(x(i), y(avg));
+      started = true;
+    } else {
+      ctx.lineTo(x(i), y(avg));
+    }
   });
   ctx.stroke();
 }
 
 async function recommend() {
-  setStatus("正在掃描台股高流動性候選池...", "loading");
+  setStatus("正在掃描台股候選池...", "loading");
   try {
-    const params = new URLSearchParams({ limit: "16", years: Math.min(Number(el.years.value || 2), 5).toString() });
-    const data = await getJson(`/api/recommend?${params}`);
+    const params = new URLSearchParams({ limit: "8", years: "2" });
+    const data = await getJson(`/api/recommend?${params}`, {}, 120000);
     const best = data.best;
     if (!best) throw new Error("沒有推薦結果");
     el.bestPickSymbol.textContent = best.symbol;
@@ -300,7 +375,7 @@ async function recommend() {
 }
 
 async function runBatch() {
-  const symbols = el.batchSymbols.value.split(/[\s,，]+/).map((item) => item.trim()).filter(Boolean);
+  const symbols = el.batchSymbols.value.split(/[\s,，]+/).map((item) => item.trim()).filter(Boolean).slice(0, 8);
   if (!symbols.length) return;
   el.batchRows.innerHTML = `<tr><td colspan="8">批次分析中...</td></tr>`;
   try {
@@ -309,15 +384,15 @@ async function runBatch() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         symbols,
-        years: Number(el.years.value || 5),
+        years: Number(el.years.value || 2),
         market: el.market.value,
         target_mode: el.targetMode.value,
         threshold: Number(el.threshold.value || 0),
-        backtest_days: Number(el.backtestDays.value || 252),
-        retrain_every: Number(el.retrainEvery.value || 20),
-        external: el.external.checked
-      })
-    });
+        backtest_days: Number(el.backtestDays.value || 90),
+        retrain_every: Number(el.retrainEvery.value || 40),
+        external: false,
+      }),
+    }, 120000);
     el.batchRows.innerHTML = (data.rows || []).map((item) => {
       const up = isUp(item.direction);
       return `<tr><td>${esc(item.symbol)}</td><td class="${up ? "up-text" : "down-text"}">${up ? "看漲" : "看跌"}</td><td>${pct(item.probability_up)}</td><td>${pct(item.probability_down)}</td><td>${pct(item.confidence)}</td><td>${esc(item.news_label || "--")}</td><td>${esc(item.related_label || "--")}</td><td>${esc(item.institutional_label || "--")}</td></tr>`;
@@ -342,7 +417,6 @@ el.suggestions.addEventListener("click", (event) => {
   const button = event.target.closest("button[data-symbol]");
   if (!button) return;
   selectSymbol(button.dataset.symbol, button.dataset.name || "");
-  analyze();
 });
 el.recommendButton.addEventListener("click", recommend);
 el.batchButton.addEventListener("click", runBatch);
@@ -350,7 +424,7 @@ el.chartDays.addEventListener("change", drawCandles);
 window.addEventListener("resize", drawCandles);
 
 el.canvas.addEventListener("mousemove", (event) => {
-  const data = state.prices.slice(-Number(el.chartDays.value || 180));
+  const data = state.prices.slice(-Number(el.chartDays.value || 120));
   if (!data.length) return;
   const rect = el.canvas.getBoundingClientRect();
   const innerW = rect.width - 72;
@@ -358,7 +432,10 @@ el.canvas.addEventListener("mousemove", (event) => {
   state.hoverIndex = Math.round(x / innerW * (data.length - 1));
   drawCandles();
 });
-el.canvas.addEventListener("mouseleave", () => { state.hoverIndex = null; drawCandles(); });
+el.canvas.addEventListener("mouseleave", () => {
+  state.hoverIndex = null;
+  drawCandles();
+});
 
 document.querySelectorAll(".tab").forEach((tab) => {
   tab.addEventListener("click", () => {
@@ -369,8 +446,10 @@ document.querySelectorAll(".tab").forEach((tab) => {
   });
 });
 
+applyFastDefaults();
 updateClock();
 setInterval(updateClock, 1000);
 selectSymbol("2408.TW", "南亞科");
 searchSymbols();
-analyze();
+setStatus("輸入股票代號後按「分析」。預設是快速模式，不會一開頁面就卡住。");
+drawCandles();
