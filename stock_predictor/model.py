@@ -5,7 +5,6 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from sklearn.base import clone
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier, VotingClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
@@ -15,7 +14,7 @@ from sklearn.preprocessing import StandardScaler
 
 from .data import fetch_ohlcv
 from .features import build_features, latest_feature_row, training_matrix
-from .research import build_related_market_feature_frame, collect_research_context, infer_related_symbols
+from .research import collect_research_context
 
 
 @dataclass
@@ -86,7 +85,7 @@ def build_model(random_state: int = 42) -> VotingClassifier:
         steps=[
             ("imputer", SimpleImputer(strategy="median")),
             ("scaler", StandardScaler()),
-            ("model", LogisticRegression(max_iter=3000, class_weight="balanced", random_state=random_state)),
+            ("model", LogisticRegression(max_iter=1200, class_weight="balanced", random_state=random_state)),
         ]
     )
     forest = Pipeline(
@@ -95,12 +94,12 @@ def build_model(random_state: int = 42) -> VotingClassifier:
             (
                 "model",
                 RandomForestClassifier(
-                    n_estimators=350,
-                    max_depth=7,
-                    min_samples_leaf=12,
+                    n_estimators=90,
+                    max_depth=6,
+                    min_samples_leaf=10,
                     class_weight="balanced_subsample",
                     random_state=random_state,
-                    n_jobs=-1,
+                    n_jobs=1,
                 ),
             ),
         ]
@@ -108,10 +107,10 @@ def build_model(random_state: int = 42) -> VotingClassifier:
     gradient = Pipeline(
         steps=[
             ("imputer", SimpleImputer(strategy="median")),
-            ("model", GradientBoostingClassifier(n_estimators=160, learning_rate=0.035, max_depth=2, random_state=random_state)),
+            ("model", GradientBoostingClassifier(n_estimators=70, learning_rate=0.045, max_depth=2, random_state=random_state)),
         ]
     )
-    return VotingClassifier(estimators=[("logistic", logistic), ("forest", forest), ("gradient", gradient)], voting="soft", weights=[1.0, 1.2, 1.0])
+    return VotingClassifier(estimators=[("logistic", logistic), ("forest", forest), ("gradient", gradient)], voting="soft", weights=[1.0, 1.1, 0.9])
 
 
 def _metrics(y_true: np.ndarray, probability_up: np.ndarray) -> BacktestMetrics:
@@ -134,27 +133,30 @@ def _metrics(y_true: np.ndarray, probability_up: np.ndarray) -> BacktestMetrics:
     )
 
 
-def walk_forward_backtest(X: pd.DataFrame, y: pd.Series, backtest_days: int = 252, min_train_days: int = 504, retrain_every: int = 20, random_state: int = 42) -> BacktestMetrics:
-    if len(X) < min_train_days + 30:
+def walk_forward_backtest(
+    X: pd.DataFrame,
+    y: pd.Series,
+    backtest_days: int = 90,
+    min_train_days: int = 260,
+    retrain_every: int = 40,
+    random_state: int = 42,
+) -> BacktestMetrics:
+    del retrain_every
+    if len(X) < min_train_days + 20:
         min_train_days = max(120, int(len(X) * 0.65))
-    start = max(min_train_days, len(X) - backtest_days)
-    if start >= len(X) - 5:
-        start = max(30, int(len(X) * 0.7))
-    base_model = build_model(random_state=random_state)
-    current_model = None
-    probabilities: list[float] = []
-    actuals: list[int] = []
-    for offset, idx in enumerate(range(start, len(X))):
-        if current_model is None or offset % retrain_every == 0:
-            current_model = clone(base_model)
-            current_model.fit(X.iloc[:idx], y.iloc[:idx])
-        probabilities.append(float(current_model.predict_proba(X.iloc[[idx]])[0][1]))
-        actuals.append(int(y.iloc[idx]))
-    return _metrics(np.asarray(actuals), np.asarray(probabilities))
+    start = max(min_train_days, len(X) - min(backtest_days, 160))
+    if start >= len(X) - 10:
+        start = max(60, int(len(X) * 0.7))
+
+    model = build_model(random_state=random_state)
+    model.fit(X.iloc[:start], y.iloc[:start])
+    probabilities = model.predict_proba(X.iloc[start:])[:, 1]
+    actuals = y.iloc[start:].to_numpy(dtype=int)
+    return _metrics(actuals, probabilities)
 
 
 def confidence_label(confidence: float, backtest: BacktestMetrics) -> str:
-    if backtest.samples < 60:
+    if backtest.samples < 40:
         return "資料不足"
     if confidence >= 0.62 and backtest.edge > 0 and backtest.accuracy >= 0.53:
         return "高"
@@ -163,143 +165,160 @@ def confidence_label(confidence: float, backtest: BacktestMetrics) -> str:
     return "低"
 
 
+def apply_context_to_prediction(row: dict[str, Any], context: Any | None) -> dict[str, Any]:
+    if context is None:
+        return row
+    technical_probability_up = float(row["technical_probability_up"])
+    external_adjustment = float(context.adjustment)
+    probability_up = float(np.clip(technical_probability_up + external_adjustment, 0.03, 0.97))
+    probability_down = 1 - probability_up
+    row.update(
+        {
+            "direction": "上漲" if probability_up >= 0.5 else "下跌",
+            "probability_up": probability_up,
+            "probability_down": probability_down,
+            "external_adjustment": external_adjustment,
+            "confidence": max(probability_up, probability_down),
+            "news_score": context.news.score,
+            "news_label": context.news.label,
+            "news_count": context.news.count,
+            "related_score": context.related.score,
+            "related_label": context.related.label,
+            "related_symbols": ", ".join(context.related.symbols),
+            "market_score": context.market.score,
+            "market_label": context.market.label,
+            "event_score": context.events.score,
+            "event_label": context.events.label,
+            "expectation_score": context.expectations.score,
+            "expectation_label": context.expectations.label,
+            "valuation_score": context.valuation.score,
+            "valuation_label": context.valuation.label,
+            "technical_score": context.technical.score,
+            "technical_label": context.technical.label,
+            "liquidity_score": context.liquidity.score,
+            "liquidity_label": context.liquidity.label,
+            "institutional_score": context.institutional.score,
+            "institutional_label": context.institutional.label,
+            "derivatives_score": context.derivatives.score,
+            "derivatives_label": context.derivatives.label,
+            "macro_score": context.macro.score,
+            "macro_label": context.macro.label,
+            "foreign_net_buy_5d": context.institutional.foreign_net_5d,
+            "institutional_net_buy_5d": context.institutional.total_net_5d,
+        }
+    )
+    if context.notes:
+        row["message"] = "；".join(context.notes[:2])
+    return row
+
+
 def predict_symbol(
     symbol: str,
-    years: int = 5,
+    years: int = 3,
     market: str = "auto",
     company_name: str = "",
     threshold: float = 0.0,
-    backtest_days: int = 252,
-    retrain_every: int = 20,
+    backtest_days: int = 90,
+    retrain_every: int = 40,
     random_state: int = 42,
     target_mode: str = "next_open",
     use_external_context: bool = True,
+    ohlcv: pd.DataFrame | None = None,
 ) -> StockPrediction:
-    ohlcv = fetch_ohlcv(symbol, years=years, market=market)
+    ohlcv = fetch_ohlcv(symbol, years=years, market=market) if ohlcv is None else ohlcv.copy()
     feature_frame = build_features(ohlcv, threshold=threshold, target_mode=target_mode)
-    context_notes: list[str] = []
-    if use_external_context:
-        related_symbols = infer_related_symbols(str(ohlcv["Symbol"].iloc[-1]))
-        related_features = build_related_market_feature_frame(ohlcv, related_symbols=related_symbols, years=years)
-        if len(related_features.columns) > 1:
-            feature_frame = feature_frame.merge(related_features, on="Date", how="left")
-        else:
-            context_notes.append("關聯市場特徵無可用資料")
     X, y, _ = training_matrix(feature_frame)
-    if len(X) < 180:
+
+    if len(X) < 150:
         raise ValueError(f"{ohlcv['Symbol'].iloc[-1]}: 訓練資料太少，請增加歷史年數")
+
     backtest = walk_forward_backtest(X, y, backtest_days=backtest_days, retrain_every=retrain_every, random_state=random_state)
+
     final_model = build_model(random_state=random_state)
     final_model.fit(X, y)
     latest_X = latest_feature_row(feature_frame)
     technical_probability_up = float(final_model.predict_proba(latest_X)[0][1])
 
-    context_values = {
-        "external_adjustment": 0.0,
-        "news_score": 0.0,
-        "news_label": "無資料",
-        "news_count": 0,
-        "related_score": 0.0,
-        "related_label": "無資料",
-        "related_symbols": "",
-        "market_score": 0.0,
-        "market_label": "無資料",
-        "event_score": 0.0,
-        "event_label": "無資料",
-        "expectation_score": 0.0,
-        "expectation_label": "無資料",
-        "valuation_score": 0.0,
-        "valuation_label": "無資料",
-        "technical_score": 0.0,
-        "technical_label": "無資料",
-        "liquidity_score": 0.0,
-        "liquidity_label": "無資料",
-        "institutional_score": 0.0,
-        "institutional_label": "無資料",
-        "derivatives_score": 0.0,
-        "derivatives_label": "無資料",
-        "macro_score": 0.0,
-        "macro_label": "無資料",
-        "foreign_net_buy_5d": None,
-        "institutional_net_buy_5d": None,
-    }
-    if use_external_context:
-        context = collect_research_context(str(ohlcv["Symbol"].iloc[-1]), company_name=company_name, ohlcv=ohlcv)
-        context_values.update(
-            {
-                "external_adjustment": context.adjustment,
-                "news_score": context.news.score,
-                "news_label": context.news.label,
-                "news_count": context.news.count,
-                "related_score": context.related.score,
-                "related_label": context.related.label,
-                "related_symbols": ", ".join(context.related.symbols),
-                "market_score": context.market.score,
-                "market_label": context.market.label,
-                "event_score": context.events.score,
-                "event_label": context.events.label,
-                "expectation_score": context.expectations.score,
-                "expectation_label": context.expectations.label,
-                "valuation_score": context.valuation.score,
-                "valuation_label": context.valuation.label,
-                "technical_score": context.technical.score,
-                "technical_label": context.technical.label,
-                "liquidity_score": context.liquidity.score,
-                "liquidity_label": context.liquidity.label,
-                "institutional_score": context.institutional.score,
-                "institutional_label": context.institutional.label,
-                "derivatives_score": context.derivatives.score,
-                "derivatives_label": context.derivatives.label,
-                "macro_score": context.macro.score,
-                "macro_label": context.macro.label,
-                "foreign_net_buy_5d": context.institutional.foreign_net_5d,
-                "institutional_net_buy_5d": context.institutional.total_net_5d,
-            }
-        )
-        context_notes.extend(context.notes)
-
-    probability_up = float(np.clip(technical_probability_up + context_values["external_adjustment"], 0.03, 0.97))
+    latest = feature_frame.dropna(subset=["Adj Close"]).tail(1).iloc[0]
+    probability_up = technical_probability_up
+    context = collect_research_context(str(latest["Symbol"]), company_name=company_name, ohlcv=ohlcv, news_limit=5, institutional_days=5, related_years=1) if use_external_context else None
+    external_adjustment = float(context.adjustment) if context is not None else 0.0
+    probability_up = float(np.clip(probability_up + external_adjustment, 0.03, 0.97))
     probability_down = 1 - probability_up
     confidence = max(probability_up, probability_down)
-    direction = "上漲" if probability_up >= 0.5 else "下跌"
-    latest = feature_frame.dropna(subset=["Adj Close"]).tail(1).iloc[0]
     label = confidence_label(confidence, backtest)
-    message = ""
-    if backtest.edge <= 0:
-        message = "回測沒有打敗基準，請降低信任度"
-    elif label == "低":
-        message = "模型信心偏低，建議只作觀察"
-    if context_notes:
-        note_text = "；".join(context_notes[:2])
-        message = f"{message}；{note_text}" if message else note_text
-    return StockPrediction(
+
+    prediction = StockPrediction(
         symbol=str(latest["Symbol"]),
         latest_date=str(latest["Date"]),
         latest_close=float(latest["Adj Close"]),
-        direction=direction,
+        direction="上漲" if probability_up >= 0.5 else "下跌",
         probability_up=probability_up,
         probability_down=probability_down,
         technical_probability_up=technical_probability_up,
         technical_probability_down=1 - technical_probability_up,
+        external_adjustment=external_adjustment,
         confidence=confidence,
         confidence_label=label,
         backtest=backtest,
         target_mode=target_mode,
-        message=message,
-        **context_values,
+        message="回測沒有打敗基準，請降低信任度" if backtest.edge <= 0 else "",
+    )
+    row = apply_context_to_prediction(prediction.to_row(), context)
+    return StockPrediction(
+        symbol=row["symbol"],
+        latest_date=row["latest_date"],
+        latest_close=row["latest_close"],
+        direction=row["direction"],
+        probability_up=row["probability_up"],
+        probability_down=row["probability_down"],
+        technical_probability_up=row["technical_probability_up"],
+        technical_probability_down=row["technical_probability_down"],
+        external_adjustment=row["external_adjustment"],
+        confidence=row["confidence"],
+        confidence_label=row["confidence_label"],
+        backtest=backtest,
+        target_mode=row["target_mode"],
+        news_score=row["news_score"],
+        news_label=row["news_label"],
+        news_count=row["news_count"],
+        related_score=row["related_score"],
+        related_label=row["related_label"],
+        related_symbols=row["related_symbols"],
+        market_score=row["market_score"],
+        market_label=row["market_label"],
+        event_score=row["event_score"],
+        event_label=row["event_label"],
+        expectation_score=row["expectation_score"],
+        expectation_label=row["expectation_label"],
+        valuation_score=row["valuation_score"],
+        valuation_label=row["valuation_label"],
+        technical_score=row["technical_score"],
+        technical_label=row["technical_label"],
+        liquidity_score=row["liquidity_score"],
+        liquidity_label=row["liquidity_label"],
+        institutional_score=row["institutional_score"],
+        institutional_label=row["institutional_label"],
+        derivatives_score=row["derivatives_score"],
+        derivatives_label=row["derivatives_label"],
+        macro_score=row["macro_score"],
+        macro_label=row["macro_label"],
+        foreign_net_buy_5d=row["foreign_net_buy_5d"],
+        institutional_net_buy_5d=row["institutional_net_buy_5d"],
+        message=row["message"],
     )
 
 
 def predict_many(
     symbols: list[str],
-    years: int = 5,
+    years: int = 3,
     market: str = "auto",
     threshold: float = 0.0,
-    backtest_days: int = 252,
-    retrain_every: int = 20,
+    backtest_days: int = 90,
+    retrain_every: int = 40,
     random_state: int = 42,
     target_mode: str = "next_open",
-    use_external_context: bool = True,
+    use_external_context: bool = False,
     progress_callback: Any | None = None,
 ) -> tuple[pd.DataFrame, list[str]]:
     rows: list[dict[str, Any]] = []
@@ -308,11 +327,22 @@ def predict_many(
         if progress_callback:
             progress_callback(index, len(symbols), symbol)
         try:
-            prediction = predict_symbol(symbol, years, market, "", threshold, backtest_days, retrain_every, random_state, target_mode, use_external_context)
+            prediction = predict_symbol(
+                symbol=symbol,
+                years=years,
+                market=market,
+                threshold=threshold,
+                backtest_days=backtest_days,
+                retrain_every=retrain_every,
+                random_state=random_state,
+                target_mode=target_mode,
+                use_external_context=use_external_context,
+            )
             rows.append(prediction.to_row())
         except Exception as exc:
             errors.append(f"{symbol}: {exc}")
+
     frame = pd.DataFrame(rows)
     if not frame.empty:
-        frame = frame.sort_values(by=["confidence_label", "confidence", "backtest_edge"], ascending=[True, False, False]).reset_index(drop=True)
+        frame = frame.sort_values(by=["confidence", "backtest_edge"], ascending=[False, False]).reset_index(drop=True)
     return frame, errors
