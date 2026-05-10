@@ -8,8 +8,11 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
-from typing import Any
+import threading
+import time
+from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
+from uuid import uuid4
 
 import numpy as np
 import pandas as pd
@@ -22,6 +25,9 @@ from stock_predictor.research import collect_research_context, search_symbols
 
 ROOT = Path(__file__).resolve().parent
 WEB_ROOT = ROOT / "web"
+MAX_JOBS = 80
+ANALYSIS_JOBS: dict[str, dict[str, Any]] = {}
+JOB_LOCK = threading.Lock()
 
 
 class ReusableThreadingHTTPServer(ThreadingHTTPServer):
@@ -29,7 +35,7 @@ class ReusableThreadingHTTPServer(ThreadingHTTPServer):
 
 
 class StockAppHandler(SimpleHTTPRequestHandler):
-    server_version = "StockPredictorHTTP/1.1"
+    server_version = "StockPredictorHTTP/1.2"
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, directory=str(WEB_ROOT), **kwargs)
@@ -41,6 +47,12 @@ class StockAppHandler(SimpleHTTPRequestHandler):
             return
         if parsed.path == "/api/analyze":
             self._handle_analyze(parsed.query)
+            return
+        if parsed.path == "/api/analyze/start":
+            self._handle_analyze_start(parsed.query)
+            return
+        if parsed.path == "/api/analyze/status":
+            self._handle_analyze_status(parsed.query)
             return
         if parsed.path == "/api/recommend":
             self._handle_recommend(parsed.query)
@@ -72,52 +84,60 @@ class StockAppHandler(SimpleHTTPRequestHandler):
 
     def _handle_analyze(self, query_string: str) -> None:
         try:
-            params = parse_qs(query_string)
-            symbol = _first(params, "symbol", "2408.TW").strip()
-            company_name = _first(params, "name", "")
-            market = _first(params, "market", "auto")
-            years = _int(_first(params, "years", "2"), 2, 2, 5)
-            chart_days = _int(_first(params, "chart_days", "120"), 120, 40, 260)
-            backtest_days = _int(_first(params, "backtest_days", "90"), 90, 40, 180)
-            retrain_every = _int(_first(params, "retrain_every", "40"), 40, 20, 120)
-            threshold = _float(_first(params, "threshold", "0"), 0.0, -0.2, 0.2)
-            target_mode = _first(params, "target_mode", "next_open")
-            use_external = _bool(_first(params, "external", "false"))
-
-            if not symbol:
-                raise ValueError("請輸入股票代號")
-
-            symbol, company_name = _resolve_symbol_input(symbol, company_name, market)
-            payload = _cached_analysis(
-                symbol,
-                company_name,
-                market,
-                years,
-                chart_days,
-                backtest_days,
-                retrain_every,
-                round(threshold, 5),
-                target_mode,
-                use_external,
-            )
+            args = _parse_analysis_args(query_string)
+            payload = _cached_analysis(*args)
             self._send_json(payload)
         except Exception as exc:
             self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+
+    def _handle_analyze_start(self, query_string: str) -> None:
+        try:
+            args = _parse_analysis_args(query_string)
+            _cleanup_jobs()
+            job_id = uuid4().hex
+            now = time.time()
+            with JOB_LOCK:
+                ANALYSIS_JOBS[job_id] = {
+                    "id": job_id,
+                    "status": "queued",
+                    "progress": 0,
+                    "message": "已建立分析任務，準備開始。",
+                    "created_at": now,
+                    "updated_at": now,
+                    "result": None,
+                    "error": None,
+                }
+            thread = threading.Thread(target=_run_analysis_job, args=(job_id, args), daemon=True)
+            thread.start()
+            self._send_json({"job_id": job_id, "status": "queued", "progress": 0, "message": "已建立分析任務，準備開始。"})
+        except Exception as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+
+    def _handle_analyze_status(self, query_string: str) -> None:
+        params = parse_qs(query_string)
+        job_id = _first(params, "id", "")
+        with JOB_LOCK:
+            job = ANALYSIS_JOBS.get(job_id)
+            payload = dict(job) if job else None
+        if payload is None:
+            self._send_json({"error": "找不到分析任務，請重新按分析。"}, status=HTTPStatus.NOT_FOUND)
+            return
+        self._send_json(payload)
 
     def _handle_batch(self) -> None:
         try:
             length = int(self.headers.get("Content-Length", "0"))
             payload = json.loads(self.rfile.read(length) or b"{}")
-            symbols = [str(item).strip() for item in payload.get("symbols", []) if str(item).strip()][:8]
+            symbols = [str(item).strip() for item in payload.get("symbols", []) if str(item).strip()][:12]
             frame, errors = predict_many(
                 symbols=symbols,
-                years=int(payload.get("years", 2)),
+                years=int(payload.get("years", 5)),
                 market=str(payload.get("market", "auto")),
                 threshold=float(payload.get("threshold", 0)),
-                backtest_days=min(int(payload.get("backtest_days", 90)), 180),
-                retrain_every=int(payload.get("retrain_every", 40)),
+                backtest_days=min(int(payload.get("backtest_days", 252)), 252),
+                retrain_every=int(payload.get("retrain_every", 20)),
                 target_mode=str(payload.get("target_mode", "next_open")),
-                use_external_context=bool(payload.get("external", False)),
+                use_external_context=bool(payload.get("external", True)),
             )
             rows = [] if frame.empty else _clean_json(frame.to_dict(orient="records"))
             self._send_json({"rows": rows, "errors": errors})
@@ -127,8 +147,8 @@ class StockAppHandler(SimpleHTTPRequestHandler):
     def _handle_recommend(self, query_string: str) -> None:
         try:
             params = parse_qs(query_string)
-            limit = _int(_first(params, "limit", "8"), 8, 5, 16)
-            years = _int(_first(params, "years", "2"), 2, 2, 3)
+            limit = _int(_first(params, "limit", "16"), 16, 5, 36)
+            years = _int(_first(params, "years", "2"), 2, 2, 5)
             best, ranked, errors = recommend_taiwan_stock(limit=limit, years=years)
             self._send_json({"best": best.to_row() if best else None, "ranked": ranked, "errors": errors})
         except Exception as exc:
@@ -144,6 +164,26 @@ class StockAppHandler(SimpleHTTPRequestHandler):
         self.wfile.write(data)
 
 
+def _parse_analysis_args(query_string: str) -> tuple[str, str, str, int, int, int, int, float, str, bool]:
+    params = parse_qs(query_string)
+    symbol = _first(params, "symbol", "2408.TW").strip()
+    company_name = _first(params, "name", "")
+    market = _first(params, "market", "auto")
+    years = _int(_first(params, "years", "5"), 5, 2, 10)
+    chart_days = _int(_first(params, "chart_days", "180"), 180, 40, 520)
+    backtest_days = _int(_first(params, "backtest_days", "252"), 252, 60, 500)
+    retrain_every = _int(_first(params, "retrain_every", "20"), 20, 5, 120)
+    threshold = _float(_first(params, "threshold", "0"), 0.0, -0.2, 0.2)
+    target_mode = _first(params, "target_mode", "next_open")
+    use_external = _bool(_first(params, "external", "true"))
+
+    if not symbol:
+        raise ValueError("請輸入股票代號")
+
+    symbol, company_name = _resolve_symbol_input(symbol, company_name, market)
+    return (symbol, company_name, market, years, chart_days, backtest_days, retrain_every, round(threshold, 5), target_mode, use_external)
+
+
 @lru_cache(maxsize=64)
 def _cached_analysis(
     symbol: str,
@@ -157,7 +197,38 @@ def _cached_analysis(
     target_mode: str,
     use_external: bool,
 ) -> dict[str, Any]:
+    return _build_analysis_payload(
+        symbol,
+        company_name,
+        market,
+        years,
+        chart_days,
+        backtest_days,
+        retrain_every,
+        threshold,
+        target_mode,
+        use_external,
+    )
+
+
+def _build_analysis_payload(
+    symbol: str,
+    company_name: str,
+    market: str,
+    years: int,
+    chart_days: int,
+    backtest_days: int,
+    retrain_every: int,
+    threshold: float,
+    target_mode: str,
+    use_external: bool,
+    progress: Callable[[int, str], None] | None = None,
+) -> dict[str, Any]:
+    notify = progress or (lambda _percent, _message: None)
+    notify(8, "抓取歷史股價與成交量。")
     prices = fetch_ohlcv(symbol, years=years, market=market)
+
+    notify(30, "建立技術指標並訓練預測模型。")
     prediction = predict_symbol(
         symbol=symbol,
         years=years,
@@ -170,17 +241,23 @@ def _cached_analysis(
         use_external_context=False,
         ohlcv=prices,
     ).to_row()
+
+    notify(58, "完成模型回測，整理 K 線資料。")
     context = None
     if use_external:
+        notify(68, "抓取新聞、法人籌碼、同業與美股關聯。")
         context = collect_research_context(
             symbol,
             company_name=company_name,
             ohlcv=prices,
-            news_limit=5,
-            institutional_days=5,
-            related_years=1,
+            news_limit=12,
+            institutional_days=8,
+            related_years=2,
         )
+        notify(88, "整合十因子矩陣並修正機率。")
         prediction = apply_context_to_prediction(prediction, context)
+    else:
+        notify(88, "快速模式完成，未啟用外部資料修正。")
 
     return {
         "symbol": prediction["symbol"],
@@ -189,6 +266,38 @@ def _cached_analysis(
         "prices": _price_records(prices.tail(chart_days)),
         "context": _context_payload(context),
     }
+
+
+def _run_analysis_job(job_id: str, args: tuple[str, str, str, int, int, int, int, float, str, bool]) -> None:
+    def progress(percent: int, message: str) -> None:
+        _update_job(job_id, status="running", progress=percent, message=message)
+
+    try:
+        progress(3, "分析任務開始。")
+        result = _build_analysis_payload(*args, progress=progress)
+        _update_job(job_id, status="done", progress=100, message="分析完成。", result=result)
+    except Exception as exc:
+        _update_job(job_id, status="error", progress=100, message="分析失敗。", error=str(exc))
+
+
+def _update_job(job_id: str, **updates: Any) -> None:
+    with JOB_LOCK:
+        job = ANALYSIS_JOBS.get(job_id)
+        if not job:
+            return
+        job.update(updates)
+        job["updated_at"] = time.time()
+
+
+def _cleanup_jobs() -> None:
+    cutoff = time.time() - 60 * 60
+    with JOB_LOCK:
+        for job_id in [job_id for job_id, job in ANALYSIS_JOBS.items() if job.get("updated_at", 0) < cutoff]:
+            ANALYSIS_JOBS.pop(job_id, None)
+        if len(ANALYSIS_JOBS) > MAX_JOBS:
+            oldest = sorted(ANALYSIS_JOBS.items(), key=lambda item: item[1].get("updated_at", 0))
+            for job_id, _job in oldest[: len(ANALYSIS_JOBS) - MAX_JOBS]:
+                ANALYSIS_JOBS.pop(job_id, None)
 
 
 def _price_records(frame: pd.DataFrame) -> list[dict[str, Any]]:
@@ -239,7 +348,7 @@ def _context_payload(context: Any | None) -> dict[str, Any] | None:
 
 def _clean_json(value: Any) -> Any:
     if isinstance(value, dict):
-        return {key: _clean_json(item) for key, item in value.items()}
+        return {key: _clean_json(item) for key, item in value.items() if key not in {"created_at", "updated_at"}}
     if isinstance(value, list):
         return [_clean_json(item) for item in value]
     if isinstance(value, tuple):
@@ -266,7 +375,7 @@ def _resolve_symbol_input(symbol: str, company_name: str, market: str) -> tuple[
 
 
 def _looks_like_ticker(symbol: str) -> bool:
-    allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.^-=")
+    allowed = set("ABCDEFFHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.^-=")
     return bool(symbol) and all(char in allowed for char in symbol)
 
 

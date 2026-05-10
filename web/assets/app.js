@@ -6,6 +6,7 @@ const state = {
   hoverIndex: null,
   searchTimer: null,
   analyzing: false,
+  pollTimer: null,
 };
 
 const el = {
@@ -78,7 +79,7 @@ function showMessage(text) {
   el.messageBox.textContent = text || "";
 }
 
-async function getJson(url, options = {}, timeoutMs = 120000) {
+async function getJson(url, options = {}, timeoutMs = 30000) {
   const controller = new AbortController();
   const timer = window.setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -87,21 +88,19 @@ async function getJson(url, options = {}, timeoutMs = 120000) {
     if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
     return data;
   } catch (error) {
-    if (error.name === "AbortError") {
-      throw new Error("分析超過 120 秒，請先關閉外部資料或降低歷史年數後再試。");
-    }
+    if (error.name === "AbortError") throw new Error("連線逾時，請稍後再試。");
     throw error;
   } finally {
     window.clearTimeout(timer);
   }
 }
 
-function applyFastDefaults() {
-  el.years.value = "2";
-  el.chartDays.value = "120";
-  el.backtestDays.value = "90";
-  el.retrainEvery.value = "40";
-  el.external.checked = false;
+function applyFullDefaults() {
+  el.years.value = "5";
+  el.chartDays.value = "180";
+  el.backtestDays.value = "252";
+  el.retrainEvery.value = "20";
+  el.external.checked = true;
 }
 
 function analysisParams() {
@@ -155,19 +154,54 @@ async function analyze(event) {
 
   state.analyzing = true;
   el.form.querySelector("button[type='submit']").disabled = true;
-  setStatus(`正在分析 ${state.selected.symbol}，第一次查詢可能需要 10 到 40 秒...`, "loading");
-  showMessage(el.external.checked ? "進階外部資料已開啟，會額外抓新聞、法人與關聯市場，因此會比較久。" : "目前使用快速模式。需要新聞、法人與美股關聯時，可以勾選外部資料後再分析。");
+  setStatus(`0%｜建立 ${state.selected.symbol} 完整分析任務...`, "loading");
+  showMessage("完整模式會分析股價、K 線、回測、新聞、法人籌碼、同業/美股、大盤、估值、量能、宏觀與十因子。過程會持續更新，不是卡住。");
+
   try {
-    const data = await getJson(`/api/analyze?${analysisParams()}`);
-    renderAnalysis(data);
-    setStatus(`完成 ${data.symbol} 隔日開盤預測`, "");
+    const started = await getJson(`/api/analyze/start?${analysisParams()}`, {}, 30000);
+    pollAnalysisJob(started.job_id);
   } catch (error) {
-    setStatus(`分析失敗：${error.message}`, "error");
-    showMessage("如果是 Render 免費版剛喚醒，請等 30 秒後重試。若仍然太慢，先取消勾選「新聞 / 法人 / 美股關聯」。");
-  } finally {
-    state.analyzing = false;
-    el.form.querySelector("button[type='submit']").disabled = false;
+    finishAnalysis();
+    setStatus(`分析啟動失敗：${error.message}`, "error");
+    showMessage("Render 免費版剛喚醒時可能比較慢，請等一下再按分析。");
   }
+}
+
+function pollAnalysisJob(jobId) {
+  window.clearTimeout(state.pollTimer);
+  state.pollTimer = window.setTimeout(async () => {
+    try {
+      const job = await getJson(`/api/analyze/status?id=${encodeURIComponent(jobId)}`, {}, 30000);
+      const progress = Number(job.progress || 0);
+      const message = job.message || "分析中...";
+      setStatus(`${progress}%｜${message}`, job.status === "error" ? "error" : "loading");
+      showMessage(message);
+
+      if (job.status === "done") {
+        renderAnalysis(job.result);
+        setStatus(`100%｜完成 ${job.result.symbol} 隔日開盤預測`, "");
+        finishAnalysis();
+        return;
+      }
+      if (job.status === "error") {
+        setStatus(`分析失敗：${job.error || message}`, "error");
+        showMessage(job.error || message);
+        finishAnalysis();
+        return;
+      }
+      pollAnalysisJob(jobId);
+    } catch (error) {
+      setStatus(`讀取進度失敗：${error.message}`, "error");
+      showMessage("進度讀取失敗，請重新按分析。");
+      finishAnalysis();
+    }
+  }, 1800);
+}
+
+function finishAnalysis() {
+  state.analyzing = false;
+  el.form.querySelector("button[type='submit']").disabled = false;
+  window.clearTimeout(state.pollTimer);
 }
 
 function renderAnalysis(data) {
@@ -216,7 +250,7 @@ function renderFactors(factors, adjustment) {
       <b>${signed(factor.score)}</b>
       <small>${esc(factor.label || factor.detail || "中性")}</small>
     </article>`;
-  }).join("") || `<article class="factor-card"><strong>快速模式</strong><small>勾選外部資料後會顯示十因子矩陣。</small></article>`;
+  }).join("") || `<article class="factor-card"><strong>等待分析</strong><small>完整分析完成後會顯示十因子矩陣。</small></article>`;
 }
 
 function renderNews(news) {
@@ -224,7 +258,7 @@ function renderNews(news) {
   el.newsRows.innerHTML = items.map((item) => `
     <tr><td>${esc((item.published_at || "").slice(0, 16) || "--")}</td><td>${esc(item.publisher || "--")}</td>
       <td><a href="${esc(item.link || "#")}" target="_blank" rel="noreferrer">${esc(item.title || "無標題")}</a></td>
-      <td class="${Number(item.score) >= 0 ? "up-text" : "down-text"}">${signed(item.score)}</td></tr>`).join("") || `<tr><td colspan="4">快速模式未抓新聞，勾選外部資料後再分析即可顯示。</td></tr>`;
+      <td class="${Number(item.score) >= 0 ? "up-text" : "down-text"}">${signed(item.score)}</td></tr>`).join("") || `<tr><td colspan="4">目前沒有抓到新聞。</td></tr>`;
 }
 
 function renderMarket(market, macro) {
@@ -232,9 +266,9 @@ function renderMarket(market, macro) {
   el.marketRows.innerHTML = moves.map((item) => `
     <tr><td>${esc(item.name || item.symbol)}</td><td>${esc(item.category || "--")}</td><td>${esc(item.latest_date || "--")}</td>
       <td class="${Number(item.return_1d) >= 0 ? "up-text" : "down-text"}">${pct(item.return_1d)}</td>
-      <td class="${Number(item.return_5d) >= 0 ? "up-text" : "down-text"}">${pct(item.return_5d)}</td><td>${signed(item.score)}</td></tr>`).join("") || `<tr><td colspan="6">快速模式未抓大盤外部資料。</td></tr>`;
-  el.macroSummary.textContent = macro.label || market.message || "快速模式未抓宏觀資料。";
-  el.macroList.innerHTML = (macro.highlights || []).map((item) => `<li>${esc(item)}</li>`).join("") || `<li>勾選外部資料後會抓宏觀事件摘要。</li>`;
+      <td class="${Number(item.return_5d) >= 0 ? "up-text" : "down-text"}">${pct(item.return_5d)}</td><td>${signed(item.score)}</td></tr>`).join("") || `<tr><td colspan="6">市場資料不足。</td></tr>`;
+  el.macroSummary.textContent = macro.label || market.message || "宏觀資料會依資料源可用性更新。";
+  el.macroList.innerHTML = (macro.highlights || []).map((item) => `<li>${esc(item)}</li>`).join("") || `<li>尚無重大宏觀事件摘要。</li>`;
 }
 
 function renderRelated(related) {
@@ -243,13 +277,13 @@ function renderRelated(related) {
     <tr><td>${esc(item.symbol)}</td><td>${esc(item.latest_date || "--")}</td>
       <td class="${Number(item.return_1d) >= 0 ? "up-text" : "down-text"}">${pct(item.return_1d)}</td>
       <td class="${Number(item.return_5d) >= 0 ? "up-text" : "down-text"}">${pct(item.return_5d)}</td>
-      <td class="${Number(item.return_20d) >= 0 ? "up-text" : "down-text"}">${pct(item.return_20d)}</td></tr>`).join("") || `<tr><td colspan="5">快速模式未抓同業關聯。</td></tr>`;
+      <td class="${Number(item.return_20d) >= 0 ? "up-text" : "down-text"}">${pct(item.return_20d)}</td></tr>`).join("") || `<tr><td colspan="5">未找到明確同業關聯。</td></tr>`;
 }
 
 function renderFlow(institutional) {
   const rows = institutional.rows || [];
   el.flowRows.innerHTML = rows.map((item) => `
-    <tr><td>${esc(item.date)}</td><td>${flow(item.foreign_net)}</td><td>${flow(item.investment_trust_net)}</td><td>${flow(item.dealer_net)}</td><td>${flow(item.total_net)}</td></tr>`).join("") || `<tr><td colspan="5">${esc(institutional.message || "快速模式未抓法人籌碼。")}</td></tr>`;
+    <tr><td>${esc(item.date)}</td><td>${flow(item.foreign_net)}</td><td>${flow(item.investment_trust_net)}</td><td>${flow(item.dealer_net)}</td><td>${flow(item.total_net)}</td></tr>`).join("") || `<tr><td colspan="5">${esc(institutional.message || "目前沒有法人籌碼資料。")}</td></tr>`;
 }
 
 function candleValue(row, key) {
@@ -271,7 +305,7 @@ function drawCandles() {
   ctx.fillStyle = "#0d1117";
   ctx.fillRect(0, 0, w, h);
 
-  const data = state.prices.slice(-Number(el.chartDays.value || 120));
+  const data = state.prices.slice(-Number(el.chartDays.value || 180));
   if (!data.length) {
     ctx.fillStyle = "#8b98a8";
     ctx.fillText("等待價格資料", 24, 34);
@@ -331,8 +365,8 @@ function drawCandles() {
     const xx = x(Math.max(0, Math.min(data.length - 1, hover)));
     ctx.strokeStyle = "rgba(255,255,255,.36)";
     ctx.beginPath();
-    ctx.moveTo(xx, pad.t);
-    ctx.lineTo(xx, h - pad.b);
+    ctx.moveTo(xx, 18);
+    ctx.lineTo(xx, h - 32);
     ctx.stroke();
   }
   el.hoverInfo.textContent = `${candleValue(shown, "date")} O ${money(candleValue(shown, "open"))} H ${money(candleValue(shown, "high"))} L ${money(candleValue(shown, "low"))} C ${money(candleValue(shown, "close"))} Vol ${flow(candleValue(shown, "volume"))}`;
@@ -361,7 +395,7 @@ function drawAverage(ctx, data, windowSize, x, y, color) {
 async function recommend() {
   setStatus("正在掃描台股候選池...", "loading");
   try {
-    const params = new URLSearchParams({ limit: "8", years: "2" });
+    const params = new URLSearchParams({ limit: "16", years: Math.min(Number(el.years.value || 2), 5).toString() });
     const data = await getJson(`/api/recommend?${params}`, {}, 120000);
     const best = data.best;
     if (!best) throw new Error("沒有推薦結果");
@@ -375,7 +409,7 @@ async function recommend() {
 }
 
 async function runBatch() {
-  const symbols = el.batchSymbols.value.split(/[\s,，]+/).map((item) => item.trim()).filter(Boolean).slice(0, 8);
+  const symbols = el.batchSymbols.value.split(/[\s,，]+/).map((item) => item.trim()).filter(Boolean).slice(0, 12);
   if (!symbols.length) return;
   el.batchRows.innerHTML = `<tr><td colspan="8">批次分析中...</td></tr>`;
   try {
@@ -384,13 +418,13 @@ async function runBatch() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         symbols,
-        years: Number(el.years.value || 2),
+        years: Number(el.years.value || 5),
         market: el.market.value,
         target_mode: el.targetMode.value,
         threshold: Number(el.threshold.value || 0),
-        backtest_days: Number(el.backtestDays.value || 90),
-        retrain_every: Number(el.retrainEvery.value || 40),
-        external: false,
+        backtest_days: Number(el.backtestDays.value || 252),
+        retrain_every: Number(el.retrainEvery.value || 20),
+        external: el.external.checked,
       }),
     }, 120000);
     el.batchRows.innerHTML = (data.rows || []).map((item) => {
@@ -417,6 +451,7 @@ el.suggestions.addEventListener("click", (event) => {
   const button = event.target.closest("button[data-symbol]");
   if (!button) return;
   selectSymbol(button.dataset.symbol, button.dataset.name || "");
+  analyze();
 });
 el.recommendButton.addEventListener("click", recommend);
 el.batchButton.addEventListener("click", runBatch);
@@ -424,7 +459,7 @@ el.chartDays.addEventListener("change", drawCandles);
 window.addEventListener("resize", drawCandles);
 
 el.canvas.addEventListener("mousemove", (event) => {
-  const data = state.prices.slice(-Number(el.chartDays.value || 120));
+  const data = state.prices.slice(-Number(el.chartDays.value || 180));
   if (!data.length) return;
   const rect = el.canvas.getBoundingClientRect();
   const innerW = rect.width - 72;
@@ -446,10 +481,9 @@ document.querySelectorAll(".tab").forEach((tab) => {
   });
 });
 
-applyFastDefaults();
+applyFullDefaults();
 updateClock();
 setInterval(updateClock, 1000);
 selectSymbol("2408.TW", "南亞科");
 searchSymbols();
-setStatus("輸入股票代號後按「分析」。預設是快速模式，不會一開頁面就卡住。");
-drawCandles();
+analyze();
