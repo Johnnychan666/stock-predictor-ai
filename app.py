@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict
+from functools import lru_cache
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -14,7 +15,7 @@ import numpy as np
 import pandas as pd
 
 from stock_predictor.data import fetch_ohlcv
-from stock_predictor.model import predict_many, predict_symbol
+from stock_predictor.model import apply_context_to_prediction, predict_many, predict_symbol
 from stock_predictor.recommender import recommend_taiwan_stock
 from stock_predictor.research import collect_research_context, search_symbols
 
@@ -28,7 +29,7 @@ class ReusableThreadingHTTPServer(ThreadingHTTPServer):
 
 
 class StockAppHandler(SimpleHTTPRequestHandler):
-    server_version = "StockPredictorHTTP/1.0"
+    server_version = "StockPredictorHTTP/1.1"
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, directory=str(WEB_ROOT), **kwargs)
@@ -75,41 +76,31 @@ class StockAppHandler(SimpleHTTPRequestHandler):
             symbol = _first(params, "symbol", "2408.TW").strip()
             company_name = _first(params, "name", "")
             market = _first(params, "market", "auto")
-            years = _int(_first(params, "years", "5"), 5, 2, 10)
-            chart_days = _int(_first(params, "chart_days", "180"), 180, 40, 520)
-            backtest_days = _int(_first(params, "backtest_days", "252"), 252, 60, 500)
-            retrain_every = _int(_first(params, "retrain_every", "20"), 20, 5, 80)
+            years = _int(_first(params, "years", "2"), 2, 2, 5)
+            chart_days = _int(_first(params, "chart_days", "120"), 120, 40, 260)
+            backtest_days = _int(_first(params, "backtest_days", "90"), 90, 40, 180)
+            retrain_every = _int(_first(params, "retrain_every", "40"), 40, 20, 120)
             threshold = _float(_first(params, "threshold", "0"), 0.0, -0.2, 0.2)
             target_mode = _first(params, "target_mode", "next_open")
-            use_external = _bool(_first(params, "external", "true"))
+            use_external = _bool(_first(params, "external", "false"))
 
             if not symbol:
                 raise ValueError("請輸入股票代號")
 
             symbol, company_name = _resolve_symbol_input(symbol, company_name, market)
-            prices = fetch_ohlcv(symbol, years=years, market=market)
-            prediction = predict_symbol(
-                symbol=symbol,
-                years=years,
-                market=market,
-                company_name=company_name,
-                threshold=threshold,
-                backtest_days=backtest_days,
-                retrain_every=retrain_every,
-                target_mode=target_mode,
-                use_external_context=use_external,
-            ).to_row()
-            context = collect_research_context(symbol, company_name=company_name, ohlcv=prices) if use_external else None
-
-            self._send_json(
-                {
-                    "symbol": prediction["symbol"],
-                    "name": company_name,
-                    "prediction": prediction,
-                    "prices": _price_records(prices.tail(chart_days)),
-                    "context": _context_payload(context),
-                }
+            payload = _cached_analysis(
+                symbol,
+                company_name,
+                market,
+                years,
+                chart_days,
+                backtest_days,
+                retrain_every,
+                round(threshold, 5),
+                target_mode,
+                use_external,
             )
+            self._send_json(payload)
         except Exception as exc:
             self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
 
@@ -117,16 +108,16 @@ class StockAppHandler(SimpleHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length", "0"))
             payload = json.loads(self.rfile.read(length) or b"{}")
-            symbols = [str(item).strip() for item in payload.get("symbols", []) if str(item).strip()]
+            symbols = [str(item).strip() for item in payload.get("symbols", []) if str(item).strip()][:8]
             frame, errors = predict_many(
                 symbols=symbols,
-                years=int(payload.get("years", 5)),
+                years=int(payload.get("years", 2)),
                 market=str(payload.get("market", "auto")),
                 threshold=float(payload.get("threshold", 0)),
-                backtest_days=int(payload.get("backtest_days", 252)),
-                retrain_every=int(payload.get("retrain_every", 20)),
+                backtest_days=min(int(payload.get("backtest_days", 90)), 180),
+                retrain_every=int(payload.get("retrain_every", 40)),
                 target_mode=str(payload.get("target_mode", "next_open")),
-                use_external_context=bool(payload.get("external", True)),
+                use_external_context=bool(payload.get("external", False)),
             )
             rows = [] if frame.empty else _clean_json(frame.to_dict(orient="records"))
             self._send_json({"rows": rows, "errors": errors})
@@ -136,8 +127,8 @@ class StockAppHandler(SimpleHTTPRequestHandler):
     def _handle_recommend(self, query_string: str) -> None:
         try:
             params = parse_qs(query_string)
-            limit = _int(_first(params, "limit", "16"), 16, 5, 36)
-            years = _int(_first(params, "years", "2"), 2, 2, 5)
+            limit = _int(_first(params, "limit", "8"), 8, 5, 16)
+            years = _int(_first(params, "years", "2"), 2, 2, 3)
             best, ranked, errors = recommend_taiwan_stock(limit=limit, years=years)
             self._send_json({"best": best.to_row() if best else None, "ranked": ranked, "errors": errors})
         except Exception as exc:
@@ -151,6 +142,53 @@ class StockAppHandler(SimpleHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+
+@lru_cache(maxsize=64)
+def _cached_analysis(
+    symbol: str,
+    company_name: str,
+    market: str,
+    years: int,
+    chart_days: int,
+    backtest_days: int,
+    retrain_every: int,
+    threshold: float,
+    target_mode: str,
+    use_external: bool,
+) -> dict[str, Any]:
+    prices = fetch_ohlcv(symbol, years=years, market=market)
+    prediction = predict_symbol(
+        symbol=symbol,
+        years=years,
+        market=market,
+        company_name=company_name,
+        threshold=threshold,
+        backtest_days=backtest_days,
+        retrain_every=retrain_every,
+        target_mode=target_mode,
+        use_external_context=False,
+        ohlcv=prices,
+    ).to_row()
+    context = None
+    if use_external:
+        context = collect_research_context(
+            symbol,
+            company_name=company_name,
+            ohlcv=prices,
+            news_limit=5,
+            institutional_days=5,
+            related_years=1,
+        )
+        prediction = apply_context_to_prediction(prediction, context)
+
+    return {
+        "symbol": prediction["symbol"],
+        "name": company_name,
+        "prediction": prediction,
+        "prices": _price_records(prices.tail(chart_days)),
+        "context": _context_payload(context),
+    }
 
 
 def _price_records(frame: pd.DataFrame) -> list[dict[str, Any]]:
